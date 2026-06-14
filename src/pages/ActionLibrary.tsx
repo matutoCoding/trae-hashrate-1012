@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Play,
   Pause,
+  Square,
   Search,
   Plus,
   Edit2,
@@ -19,7 +20,8 @@ import { useAppStore } from '@/store/useAppStore';
 import { cn } from '@/lib/utils';
 import { generateId } from '@/utils/defaultData';
 import { ShadowPuppetCanvas } from '@/components/canvas/ShadowPuppetCanvas';
-import { Action, Character } from '@/types';
+import { Action, Character, JointState, StickState } from '@/types';
+import { lerp, lerpPoint, applyEasing } from '@/utils/kinematics';
 
 const CATEGORIES = [
   { id: 'all', name: '全部', icon: Layers },
@@ -398,6 +400,7 @@ interface PreviewPanelProps {
   currentTime: number;
   onPlay: () => void;
   onPause: () => void;
+  onStop: () => void;
   onToggleLoop: () => void;
   onSeek: (time: number) => void;
   onApply: () => void;
@@ -413,6 +416,7 @@ function PreviewPanel({
   currentTime,
   onPlay,
   onPause,
+  onStop,
   onToggleLoop,
   onSeek,
   onApply,
@@ -458,22 +462,54 @@ function PreviewPanel({
             'transition-colors duration-200',
             'shadow-shadow-puppet'
           )}
+          title={isPlaying ? '暂停' : '播放'}
         >
           {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
         </button>
+        <button
+          onClick={onStop}
+          className={cn(
+            'w-10 h-10 rounded-full flex items-center justify-center',
+            'bg-parchment-200 text-ink-600',
+            'hover:bg-parchment-300',
+            'transition-colors duration-200'
+          )}
+          title="停止"
+        >
+          <Square className="w-4 h-4" />
+        </button>
         <div className="flex-1">
           <div
-            className="h-2 bg-parchment-200 rounded-full cursor-pointer overflow-hidden"
+            className="h-2 bg-parchment-200 rounded-full cursor-pointer overflow-hidden relative"
             onClick={(e) => {
               const rect = e.currentTarget.getBoundingClientRect();
               const x = e.clientX - rect.left;
               const percentage = x / rect.width;
               onSeek(percentage * action.duration);
             }}
+            onMouseDown={(e) => {
+              const target = e.currentTarget;
+              const handleMove = (moveEvent: MouseEvent) => {
+                const rect = target.getBoundingClientRect();
+                const x = moveEvent.clientX - rect.left;
+                const percentage = Math.max(0, Math.min(1, x / rect.width));
+                onSeek(percentage * action.duration);
+              };
+              const handleUp = () => {
+                document.removeEventListener('mousemove', handleMove);
+                document.removeEventListener('mouseup', handleUp);
+              };
+              document.addEventListener('mousemove', handleMove);
+              document.addEventListener('mouseup', handleUp);
+            }}
           >
             <div
               className="h-full bg-crimson-500 rounded-full transition-all duration-100"
               style={{ width: `${progress}%` }}
+            />
+            <div
+              className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full shadow-md border-2 border-crimson-500 transition-all duration-100"
+              style={{ left: `calc(${progress}% - 8px)` }}
             />
           </div>
         </div>
@@ -573,6 +609,11 @@ function PreviewPanel({
   );
 }
 
+interface AnimationState {
+  joints: Record<string, number>;
+  sticks: Record<string, { angle: number; controlPoint: { x: number; y: number } }>;
+}
+
 export default function ActionLibrary() {
   const {
     getCurrentDrama,
@@ -582,6 +623,8 @@ export default function ActionLibrary() {
     addAction,
     updateAction,
     deleteAction,
+    setCharacterJointAngle,
+    setStickState,
   } = useAppStore();
 
   const drama = getCurrentDrama();
@@ -596,9 +639,14 @@ export default function ActionLibrary() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLooping, setIsLooping] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [initialState, setInitialState] = useState<AnimationState | null>(null);
   const animationRef = useRef<number | null>(null);
   const lastTimeRef = useRef<number>(0);
   const selectedActionIdRef = useRef<string | null>(null);
+  const isPlayingRef = useRef(false);
+  const currentTimeRef = useRef(0);
+  const selectedActionRef = useRef<Action | null>(null);
+  const characterRef = useRef<Character | undefined>(undefined);
 
   const filteredActions = useMemo(() => {
     let result = actions;
@@ -621,7 +669,20 @@ export default function ActionLibrary() {
 
   useEffect(() => {
     selectedActionIdRef.current = selectedAction?.id || null;
+    selectedActionRef.current = selectedAction;
   }, [selectedAction]);
+
+  useEffect(() => {
+    characterRef.current = character;
+  }, [character]);
+
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  useEffect(() => {
+    currentTimeRef.current = currentTime;
+  }, [currentTime]);
 
   useEffect(() => {
     const actionId = selectedActionIdRef.current;
@@ -629,9 +690,151 @@ export default function ActionLibrary() {
       const updated = actions.find((a) => a.id === actionId);
       if (updated) {
         setSelectedAction(updated);
+        selectedActionRef.current = updated;
       }
     }
   }, [actions]);
+
+  useEffect(() => {
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+      restoreInitialState();
+    };
+  }, []);
+
+  function saveInitialState(char: Character) {
+    const state: AnimationState = {
+      joints: {},
+      sticks: {},
+    };
+    char.joints.forEach((joint) => {
+      state.joints[joint.id] = joint.currentAngle;
+    });
+    char.sticks.forEach((stick) => {
+      state.sticks[stick.id] = {
+        angle: stick.angle,
+        controlPoint: { ...stick.controlPoint },
+      };
+    });
+    setInitialState(state);
+  }
+
+  function restoreInitialState() {
+    if (!initialState || !currentCharacterId) return;
+    
+    Object.entries(initialState.joints).forEach(([jointId, angle]) => {
+      setCharacterJointAngle(currentCharacterId, jointId, angle);
+    });
+    
+    Object.entries(initialState.sticks).forEach(([stickId, state]) => {
+      setStickState(currentCharacterId, stickId, {
+        angle: state.angle,
+        controlPoint: state.controlPoint,
+      });
+    });
+  }
+
+  function findSurroundingKeyframes(keyframes: any[], time: number) {
+    if (keyframes.length === 0) return null;
+    
+    const sorted = [...keyframes].sort((a, b) => a.time - b.time);
+    
+    if (time <= sorted[0].time) {
+      return { prev: sorted[0], next: sorted[0], t: 0 };
+    }
+    
+    if (time >= sorted[sorted.length - 1].time) {
+      return { prev: sorted[sorted.length - 1], next: sorted[sorted.length - 1], t: 1 };
+    }
+    
+    for (let i = 0; i < sorted.length - 1; i++) {
+      if (time >= sorted[i].time && time <= sorted[i + 1].time) {
+        const duration = sorted[i + 1].time - sorted[i].time;
+        const t = duration > 0 ? (time - sorted[i].time) / duration : 0;
+        return { prev: sorted[i], next: sorted[i + 1], t };
+      }
+    }
+    
+    return null;
+  }
+
+  function interpolateJointState(prev: JointState, next: JointState, t: number): JointState {
+    return {
+      angle: lerp(prev.angle, next.angle, t),
+      position: lerpPoint(prev.position, next.position, t),
+    };
+  }
+
+  function interpolateStickState(prev: StickState, next: StickState, t: number): StickState {
+    return {
+      angle: lerp(prev.angle, next.angle, t),
+      controlPoint: lerpPoint(prev.controlPoint, next.controlPoint, t),
+    };
+  }
+
+  function applyAnimationState(time: number) {
+    const action = selectedActionRef.current;
+    const char = characterRef.current;
+    
+    if (!action || !char || !currentCharacterId) return;
+    if (action.keyframes.length === 0) return;
+    
+    const surrounding = findSurroundingKeyframes(action.keyframes, time);
+    if (!surrounding) return;
+    
+    const { prev, next, t } = surrounding;
+    const easing = prev.easing || 'linear';
+    const easedT = applyEasing(t, easing);
+    
+    const jointIds = new Set([
+      ...Object.keys(prev.joints || {}),
+      ...Object.keys(next.joints || {}),
+    ]);
+    
+    jointIds.forEach((jointId) => {
+      const prevJoint = prev.joints[jointId];
+      const nextJoint = next.joints[jointId];
+      
+      if (prevJoint && nextJoint) {
+        const interpolated = interpolateJointState(prevJoint, nextJoint, easedT);
+        setCharacterJointAngle(currentCharacterId, jointId, interpolated.angle);
+      } else if (prevJoint) {
+        setCharacterJointAngle(currentCharacterId, jointId, prevJoint.angle);
+      } else if (nextJoint) {
+        setCharacterJointAngle(currentCharacterId, jointId, nextJoint.angle);
+      }
+    });
+    
+    const stickIds = new Set([
+      ...Object.keys(prev.sticks || {}),
+      ...Object.keys(next.sticks || {}),
+    ]);
+    
+    stickIds.forEach((stickId) => {
+      const prevStick = prev.sticks[stickId];
+      const nextStick = next.sticks[stickId];
+      
+      if (prevStick && nextStick) {
+        const interpolated = interpolateStickState(prevStick, nextStick, easedT);
+        setStickState(currentCharacterId, stickId, {
+          angle: interpolated.angle,
+          controlPoint: interpolated.controlPoint,
+        });
+      } else if (prevStick) {
+        setStickState(currentCharacterId, stickId, {
+          angle: prevStick.angle,
+          controlPoint: prevStick.controlPoint,
+        });
+      } else if (nextStick) {
+        setStickState(currentCharacterId, stickId, {
+          angle: nextStick.angle,
+          controlPoint: nextStick.controlPoint,
+        });
+      }
+    });
+  }
 
   useEffect(() => {
     if (!isPlaying || !selectedAction) {
@@ -650,20 +853,37 @@ export default function ActionLibrary() {
       const delta = timestamp - lastTimeRef.current;
       lastTimeRef.current = timestamp;
 
-      setCurrentTime((prev) => {
-        let next = prev + delta;
-        if (next >= selectedAction.duration) {
-          if (isLooping) {
-            next = 0;
-          } else {
-            next = selectedAction.duration;
-            setIsPlaying(false);
-          }
-        }
-        return next;
-      });
+      const currentTime = currentTimeRef.current;
+      const action = selectedActionRef.current;
+      
+      if (!action) return;
 
-      if (isPlaying) {
+      let next = currentTime + delta;
+      let shouldStop = false;
+      
+      if (next >= action.duration) {
+        if (isLooping) {
+          next = 0;
+        } else {
+          next = action.duration;
+          shouldStop = true;
+        }
+      }
+
+      setCurrentTime(next);
+      currentTimeRef.current = next;
+      applyAnimationState(next);
+
+      if (shouldStop) {
+        setIsPlaying(false);
+        isPlayingRef.current = false;
+        setTimeout(() => {
+          restoreInitialState();
+        }, 100);
+        return;
+      }
+
+      if (isPlayingRef.current) {
         animationRef.current = requestAnimationFrame(animate);
       }
     };
@@ -678,20 +898,47 @@ export default function ActionLibrary() {
   }, [isPlaying, selectedAction, isLooping]);
 
   const handlePlay = () => {
-    if (!selectedAction) return;
+    if (!selectedAction || !character) return;
+    
+    if (!initialState) {
+      saveInitialState(character);
+    }
+    
     if (currentTime >= selectedAction.duration) {
       setCurrentTime(0);
+      currentTimeRef.current = 0;
     }
     lastTimeRef.current = 0;
     setIsPlaying(true);
+    isPlayingRef.current = true;
   };
 
   const handlePause = () => {
     setIsPlaying(false);
+    isPlayingRef.current = false;
+  };
+
+  const handleStop = () => {
+    setIsPlaying(false);
+    isPlayingRef.current = false;
+    setCurrentTime(0);
+    currentTimeRef.current = 0;
+    setTimeout(() => {
+      restoreInitialState();
+    }, 50);
   };
 
   const handleSeek = (time: number) => {
-    setCurrentTime(Math.max(0, Math.min(time, selectedAction?.duration || 0)));
+    const newTime = Math.max(0, Math.min(time, selectedAction?.duration || 0));
+    setCurrentTime(newTime);
+    currentTimeRef.current = newTime;
+    
+    if (selectedAction && character) {
+      if (!initialState) {
+        saveInitialState(character);
+      }
+      applyAnimationState(newTime);
+    }
   };
 
   const handleToggleLoop = () => {
@@ -766,9 +1013,13 @@ export default function ActionLibrary() {
   };
 
   const handleActionClick = (action: Action) => {
+    if (isPlaying) {
+      handleStop();
+    }
     setSelectedAction(action);
-    setIsPlaying(false);
     setCurrentTime(0);
+    currentTimeRef.current = 0;
+    setInitialState(null);
   };
 
   return (
@@ -860,14 +1111,228 @@ export default function ActionLibrary() {
                     <button
                       key={preset.name}
                       onClick={() => {
-                        if (currentDramaId && currentCharacterId) {
-                          const newAction: Action = {
-                            id: generateId(),
-                            name: preset.name,
-                            category: preset.category,
-                            characterId: currentCharacterId,
-                            duration: preset.duration,
-                            keyframes: [
+                        if (currentDramaId && currentCharacterId && character) {
+                          let newAction: Action;
+                          
+                          const jointMap = new Map(character.joints.map(j => [j.name, j.id]));
+                          const stickMap = new Map(character.sticks.map(s => [s.name, s.id]));
+                          
+                          const leftShoulderId = jointMap.get('左肩');
+                          const leftElbowId = jointMap.get('左肘');
+                          const rightShoulderId = jointMap.get('右肩');
+                          const rightElbowId = jointMap.get('右肘');
+                          const leftHipId = jointMap.get('左胯');
+                          const leftKneeId = jointMap.get('左膝');
+                          const rightHipId = jointMap.get('右胯');
+                          const rightKneeId = jointMap.get('右膝');
+                          const bodyTopId = jointMap.get('躯干顶');
+                          const mainStickId = stickMap.get('主签杆');
+                          const leftStickId = stickMap.get('左手签');
+                          const rightStickId = stickMap.get('右手签');
+                          
+                          const createJointState = (jointId: string | undefined, angle: number) => {
+                            if (!jointId) return null;
+                            const joint = character.joints.find(j => j.id === jointId);
+                            return joint ? { angle, position: joint.position } : null;
+                          };
+                          
+                          const createStickState = (stickId: string | undefined, angle: number, controlPoint?: { x: number; y: number }) => {
+                            if (!stickId) return null;
+                            const stick = character.sticks.find(s => s.id === stickId);
+                            return stick ? { angle, controlPoint: controlPoint || stick.controlPoint } : null;
+                          };
+                          
+                          const buildJointsObject = (states: Array<[string | undefined, number]>) => {
+                            const result: Record<string, any> = {};
+                            states.forEach(([id, angle]) => {
+                              if (id) {
+                                const state = createJointState(id, angle);
+                                if (state) result[id] = state;
+                              }
+                            });
+                            return result;
+                          };
+                          
+                          const buildSticksObject = (states: Array<[string | undefined, number, { x: number; y: number } | undefined]>) => {
+                            const result: Record<string, any> = {};
+                            states.forEach(([id, angle, cp]) => {
+                              if (id) {
+                                const state = createStickState(id, angle, cp);
+                                if (state) result[id] = state;
+                              }
+                            });
+                            return result;
+                          };
+                          
+                          let keyframes: any[] = [];
+                          
+                          if (preset.name === '走路') {
+                            keyframes = [
+                              {
+                                id: generateId(),
+                                time: 0,
+                                joints: buildJointsObject([
+                                  [leftHipId, 20],
+                                  [leftKneeId, -10],
+                                  [rightHipId, -10],
+                                  [rightKneeId, 15],
+                                  [leftShoulderId, -20],
+                                  [rightShoulderId, 20],
+                                ]),
+                                sticks: buildSticksObject([
+                                  [mainStickId, -90, undefined],
+                                  [leftStickId, -80, undefined],
+                                  [rightStickId, -100, undefined],
+                                ]),
+                                easing: 'ease-in-out',
+                              },
+                              {
+                                id: generateId(),
+                                time: 1000,
+                                joints: buildJointsObject([
+                                  [leftHipId, -10],
+                                  [leftKneeId, 15],
+                                  [rightHipId, 20],
+                                  [rightKneeId, -10],
+                                  [leftShoulderId, 20],
+                                  [rightShoulderId, -20],
+                                ]),
+                                sticks: buildSticksObject([
+                                  [mainStickId, -90, undefined],
+                                  [leftStickId, -60, undefined],
+                                  [rightStickId, -120, undefined],
+                                ]),
+                                easing: 'ease-in-out',
+                              },
+                              {
+                                id: generateId(),
+                                time: 2000,
+                                joints: buildJointsObject([
+                                  [leftHipId, 20],
+                                  [leftKneeId, -10],
+                                  [rightHipId, -10],
+                                  [rightKneeId, 15],
+                                  [leftShoulderId, -20],
+                                  [rightShoulderId, 20],
+                                ]),
+                                sticks: buildSticksObject([
+                                  [mainStickId, -90, undefined],
+                                  [leftStickId, -80, undefined],
+                                  [rightStickId, -100, undefined],
+                                ]),
+                                easing: 'ease-in-out',
+                              },
+                            ];
+                          } else if (preset.name === '作揖') {
+                            keyframes = [
+                              {
+                                id: generateId(),
+                                time: 0,
+                                joints: buildJointsObject([
+                                  [leftShoulderId, 30],
+                                  [leftElbowId, 40],
+                                  [rightShoulderId, -30],
+                                  [rightElbowId, -40],
+                                  [bodyTopId, 0],
+                                ]),
+                                sticks: buildSticksObject([
+                                  [mainStickId, -90, undefined],
+                                  [leftStickId, -70, undefined],
+                                  [rightStickId, -110, undefined],
+                                ]),
+                                easing: 'ease-out',
+                              },
+                              {
+                                id: generateId(),
+                                time: 500,
+                                joints: buildJointsObject([
+                                  [leftShoulderId, 10],
+                                  [leftElbowId, 80],
+                                  [rightShoulderId, -10],
+                                  [rightElbowId, -80],
+                                  [bodyTopId, 15],
+                                ]),
+                                sticks: buildSticksObject([
+                                  [mainStickId, -75, undefined],
+                                  [leftStickId, -45, { x: -50, y: 150 }],
+                                  [rightStickId, -135, { x: 50, y: 150 }],
+                                ]),
+                                easing: 'ease-in-out',
+                              },
+                              {
+                                id: generateId(),
+                                time: 1000,
+                                joints: buildJointsObject([
+                                  [leftShoulderId, 30],
+                                  [leftElbowId, 40],
+                                  [rightShoulderId, -30],
+                                  [rightElbowId, -40],
+                                  [bodyTopId, 0],
+                                ]),
+                                sticks: buildSticksObject([
+                                  [mainStickId, -90, undefined],
+                                  [leftStickId, -70, undefined],
+                                  [rightStickId, -110, undefined],
+                                ]),
+                                easing: 'ease-in',
+                              },
+                            ];
+                          } else if (preset.name === '抱拳') {
+                            keyframes = [
+                              {
+                                id: generateId(),
+                                time: 0,
+                                joints: buildJointsObject([
+                                  [leftShoulderId, 30],
+                                  [leftElbowId, 40],
+                                  [rightShoulderId, -30],
+                                  [rightElbowId, -40],
+                                  [bodyTopId, 0],
+                                ]),
+                                sticks: buildSticksObject([
+                                  [mainStickId, -90, undefined],
+                                  [leftStickId, -70, undefined],
+                                  [rightStickId, -110, undefined],
+                                ]),
+                                easing: 'ease-out',
+                              },
+                              {
+                                id: generateId(),
+                                time: 400,
+                                joints: buildJointsObject([
+                                  [leftShoulderId, 60],
+                                  [leftElbowId, 80],
+                                  [rightShoulderId, 0],
+                                  [rightElbowId, -80],
+                                  [bodyTopId, 0],
+                                ]),
+                                sticks: buildSticksObject([
+                                  [mainStickId, -90, undefined],
+                                  [leftStickId, -50, { x: -40, y: 150 }],
+                                  [rightStickId, -130, { x: 40, y: 150 }],
+                                ]),
+                                easing: 'ease-in-out',
+                              },
+                              {
+                                id: generateId(),
+                                time: 800,
+                                joints: buildJointsObject([
+                                  [leftShoulderId, 30],
+                                  [leftElbowId, 40],
+                                  [rightShoulderId, -30],
+                                  [rightElbowId, -40],
+                                  [bodyTopId, 0],
+                                ]),
+                                sticks: buildSticksObject([
+                                  [mainStickId, -90, undefined],
+                                  [leftStickId, -70, undefined],
+                                  [rightStickId, -110, undefined],
+                                ]),
+                                easing: 'ease-in',
+                              },
+                            ];
+                          } else {
+                            keyframes = [
                               {
                                 id: generateId(),
                                 time: 0,
@@ -875,7 +1340,16 @@ export default function ActionLibrary() {
                                 sticks: {},
                                 easing: 'ease-in-out',
                               },
-                            ],
+                            ];
+                          }
+                          
+                          newAction = {
+                            id: generateId(),
+                            name: preset.name,
+                            category: preset.category,
+                            characterId: currentCharacterId,
+                            duration: preset.duration,
+                            keyframes,
                             description: preset.description,
                             createdAt: Date.now(),
                           };
@@ -921,6 +1395,7 @@ export default function ActionLibrary() {
             currentTime={currentTime}
             onPlay={handlePlay}
             onPause={handlePause}
+            onStop={handleStop}
             onToggleLoop={handleToggleLoop}
             onSeek={handleSeek}
             onApply={handleApplyToTimeline}

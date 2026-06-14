@@ -152,6 +152,10 @@ export interface ConstraintWarning {
 export interface OcclusionInfo {
   stickId1: string;
   stickId2: string;
+  stickName1: string;
+  stickName2: string;
   intersectionPoint: Point;
   frontStickId: string;
+  isCorrect: boolean;
+  suggestion: string;
 }

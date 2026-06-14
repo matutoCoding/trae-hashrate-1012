@@ -12,9 +12,12 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { ShadowPuppetCanvas } from '@/components/canvas/ShadowPuppetCanvas';
+import { ImportPartDialog } from '@/components/ImportPartDialog';
 import { useAppStore } from '@/store/useAppStore';
 import { cn } from '@/lib/utils';
-import type { Part, Joint, Stick } from '@/types';
+import { parseSVG, getRandomShadowColor, extractFileNameWithoutExtension } from '@/utils/svgParser';
+import { generateId } from '@/utils/defaultData';
+import type { Part, Joint, Stick, PartType } from '@/types';
 
 const PartBinding: React.FC = () => {
   const currentDrama = useAppStore((state) => state.getCurrentDrama());
@@ -29,6 +32,7 @@ const PartBinding: React.FC = () => {
   const setSelectedJoint = useAppStore((state) => state.setSelectedJoint);
   const setSelectedStick = useAppStore((state) => state.setSelectedStick);
   const updatePart = useAppStore((state) => state.updatePart);
+  const addPart = useAppStore((state) => state.addPart);
   const updateJoint = useAppStore((state) => state.updateJoint);
   const updateStick = useAppStore((state) => state.updateStick);
   const setZoom = useAppStore((state) => state.setZoom);
@@ -41,6 +45,11 @@ const PartBinding: React.FC = () => {
   const [jointsExpanded, setJointsExpanded] = useState(true);
   const [sticksExpanded, setSticksExpanded] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [showImportDialog, setShowImportDialog] = useState(false);
+  const [pendingImport, setPendingImport] = useState<{
+    svgPath: string;
+    fileName: string;
+  } | null>(null);
 
   const selectedPart = currentCharacter?.parts.find((p) => p.id === selectedPartId);
   const selectedJoint = currentCharacter?.joints.find((j) => j.id === selectedJointId);
@@ -80,12 +89,59 @@ const PartBinding: React.FC = () => {
     fileInputRef.current?.click();
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      alert(`已导入部件: ${file.name}\n（模拟导入功能）`);
+      try {
+        const text = await file.text();
+        const { svgPath } = parseSVG(text);
+        setPendingImport({
+          svgPath,
+          fileName: file.name,
+        });
+        setShowImportDialog(true);
+      } catch (error) {
+        console.error('解析 SVG 失败:', error);
+        alert('SVG 文件解析失败，请检查文件格式');
+      }
     }
     e.target.value = '';
+  };
+
+  const handleImportSubmit = (data: {
+    name: string;
+    type: PartType;
+    color: string;
+    zIndex: number;
+  }) => {
+    if (!pendingImport || !currentDramaId || !currentCharacterId) return;
+
+    const newPart: Part = {
+      id: generateId(),
+      name: data.name,
+      type: data.type,
+      svgPath: pendingImport.svgPath,
+      transform: {
+        x: 0,
+        y: 0,
+        rotation: 0,
+        scale: 1,
+      },
+      zIndex: data.zIndex,
+      color: data.color,
+    };
+
+    addPart(currentDramaId, currentCharacterId, newPart);
+    setSelectedPart(newPart.id);
+    setPendingImport(null);
+  };
+
+  const getDefaultZIndex = (): number => {
+    if (!currentCharacter?.parts || currentCharacter.parts.length === 0) {
+      return 1;
+    }
+    const maxZ = Math.max(...currentCharacter.parts.map(p => p.zIndex));
+    return maxZ + 1;
   };
 
   const handleAddJoint = () => {
@@ -774,6 +830,21 @@ const PartBinding: React.FC = () => {
           )}
         </div>
       </div>
+
+      {pendingImport && (
+        <ImportPartDialog
+          isOpen={showImportDialog}
+          onClose={() => {
+            setShowImportDialog(false);
+            setPendingImport(null);
+          }}
+          onSubmit={handleImportSubmit}
+          defaultName={extractFileNameWithoutExtension(pendingImport.fileName)}
+          defaultZIndex={getDefaultZIndex()}
+          defaultColor={getRandomShadowColor()}
+          svgPath={pendingImport.svgPath}
+        />
+      )}
     </div>
   );
 };

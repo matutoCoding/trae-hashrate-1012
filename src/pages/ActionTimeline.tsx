@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   Play,
   Pause,
@@ -19,11 +19,64 @@ import {
   ChevronRight,
   CheckCircle,
   AlertTriangle,
+  Save,
+  Trash2,
+  Copy,
+  Gauge,
+  X,
+  MoveHorizontal,
+  Info,
+  Scan,
+  Wrench,
+  ArrowUpDown,
 } from 'lucide-react';
 import { ShadowPuppetCanvas } from '@/components/canvas/ShadowPuppetCanvas';
 import { useAppStore } from '@/store/useAppStore';
-import { cn } from '@/lib/utils';
-import type { Clip, Track, Action } from '@/types';
+import { cn, generateId } from '@/lib/utils';
+import { interpolateKeyframes, checkStickOcclusion, autoFixOcclusion } from '@/utils/kinematics';
+import type { Clip, Track, Action, Character, JointState, StickState, OcclusionInfo } from '@/types';
+
+interface DragState {
+  type: 'move' | 'resize-left' | 'resize-right';
+  clipId: string;
+  trackId: string;
+  startX: number;
+  startTime: number;
+  startDuration: number;
+}
+
+interface ContextMenuState {
+  show: boolean;
+  x: number;
+  y: number;
+  clip: Clip | null;
+  track: Track | null;
+}
+
+interface HoverInfo {
+  show: boolean;
+  x: number;
+  y: number;
+  clip: Clip | null;
+}
+
+interface TrackCharacterState {
+  [characterId: string]: {
+    joints: Record<string, JointState>;
+    sticks: Record<string, StickState>;
+  };
+}
+
+const TRACK_COLORS = [
+  'bg-crimson-500',
+  'bg-shadow-500',
+  'bg-ink-500',
+  'bg-emerald-500',
+  'bg-amber-500',
+  'bg-purple-500',
+  'bg-rose-500',
+  'bg-cyan-500',
+];
 
 const ActionTimeline: React.FC = () => {
   const currentDrama = useAppStore((state) => state.getCurrentDrama());
@@ -38,21 +91,38 @@ const ActionTimeline: React.FC = () => {
   const lightConfig = useAppStore((state) => state.lightConfig);
   const setLightConfig = useAppStore((state) => state.setLightConfig);
   const updateScene = useAppStore((state) => state.updateScene);
+  const updateDrama = useAppStore((state) => state.updateDrama);
+  const updateCharacter = useAppStore((state) => state.updateCharacter);
+  const setJointAngle = useAppStore((state) => state.setJointAngle);
+  const updateStick = useAppStore((state) => state.updateStick);
   const actions = currentDrama?.actions || [];
+  const characters = currentDrama?.characters || [];
 
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [timelineZoom, setTimelineZoom] = useState(1);
   const [expandedTracks, setExpandedTracks] = useState<Record<string, boolean>>({});
-  const [draggingClip, setDraggingClip] = useState<{ clipId: string; trackId: string; startX: number; startTime: number } | null>(null);
-  const [showActionLibrary, setShowActionLibrary] = useState(false);
-  const [occlusionResult, setOcclusionResult] = useState<{ show: boolean; hasIssue: boolean; message: string }>({ show: false, hasIssue: false, message: '' });
+  const [showActionDropdown, setShowActionDropdown] = useState(false);
+  const [showTrackDialog, setShowTrackDialog] = useState(false);
+  const [selectedActionForAdd, setSelectedActionForAdd] = useState<Action | null>(null);
+  const [dragState, setDragState] = useState<DragState | null>(null);
+  const [dragTimeIndicator, setDragTimeIndicator] = useState<number | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState>({ show: false, x: 0, y: 0, clip: null, track: null });
+  const [hoverInfo, setHoverInfo] = useState<HoverInfo>({ show: false, x: 0, y: 0, clip: null });
+  const [saveSuccess, setSaveSuccess] = useState(false);
+  const [draggingPlayhead, setDraggingPlayhead] = useState(false);
+  const [characterStates, setCharacterStates] = useState<TrackCharacterState>({});
+  const [showOcclusionPanel, setShowOcclusionPanel] = useState(false);
+  const [occlusionResults, setOcclusionResults] = useState<OcclusionInfo[]>([]);
+  const [occlusionChecked, setOcclusionChecked] = useState(false);
 
   const timelineRef = useRef<HTMLDivElement>(null);
   const animationFrameRef = useRef<number | null>(null);
   const lastTimeRef = useRef<number>(0);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
   const sceneDuration = currentScene?.duration || 10000;
   const pixelsPerSecond = 100 * timelineZoom;
+  const pixelsPerMs = pixelsPerSecond / 1000;
 
   useEffect(() => {
     if (currentScene?.tracks) {
@@ -65,39 +135,142 @@ const ActionTimeline: React.FC = () => {
   }, [currentScene?.id]);
 
   useEffect(() => {
-    if (isPlaying) {
-      lastTimeRef.current = performance.now();
-      const animate = (now: number) => {
-        const delta = (now - lastTimeRef.current) * playbackSpeed;
-        lastTimeRef.current = now;
-
-        const newTime = currentTime + delta;
-        if (newTime >= sceneDuration) {
-          setCurrentTime(0);
-          setPlaying(false);
-          return;
-        }
-        setCurrentTime(newTime);
-        animationFrameRef.current = requestAnimationFrame(animate);
-      };
-      animationFrameRef.current = requestAnimationFrame(animate);
-    } else {
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setShowActionDropdown(false);
       }
-    }
+      if (contextMenu.show) {
+        setContextMenu({ show: false, x: 0, y: 0, clip: null, track: null });
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [contextMenu.show]);
+
+  const applyAnimationToCharacter = useCallback(
+    (characterId: string, joints: Record<string, JointState>, sticks: Record<string, StickState>) => {
+      if (!currentDramaId) return;
+
+      Object.entries(joints).forEach(([jointId, state]) => {
+        setJointAngle(currentDramaId, characterId, jointId, state.angle);
+      });
+
+      Object.entries(sticks).forEach(([stickId, state]) => {
+        updateStick(currentDramaId, characterId, stickId, {
+          angle: state.angle,
+          controlPoint: state.controlPoint,
+        });
+      });
+    },
+    [currentDramaId, setJointAngle, updateStick]
+  );
+
+  useEffect(() => {
+    if (!isPlaying || !currentScene) return;
+
+    lastTimeRef.current = performance.now();
+    const animate = (now: number) => {
+      const delta = (now - lastTimeRef.current) * playbackSpeed;
+      lastTimeRef.current = now;
+
+      const newTime = currentTime + delta;
+      if (newTime >= sceneDuration) {
+        setCurrentTime(0);
+        setPlaying(false);
+        return;
+      }
+      setCurrentTime(newTime);
+
+      const newCharacterStates: TrackCharacterState = {};
+
+      currentScene.tracks.forEach((track) => {
+        if (!track.visible || track.locked) return;
+
+        track.clips.forEach((clip) => {
+          const clipEndTime = clip.startTime + clip.duration;
+          if (newTime >= clip.startTime && newTime <= clipEndTime) {
+            const action = actions.find((a) => a.id === clip.actionId);
+            if (!action) return;
+
+            const relativeTime = (newTime - clip.startTime) * clip.speed;
+            const clampedTime = Math.max(0, Math.min(action.duration, relativeTime));
+            const interpolated = interpolateKeyframes(action.keyframes, clampedTime);
+
+            if (!newCharacterStates[track.characterId]) {
+              newCharacterStates[track.characterId] = { joints: {}, sticks: {} };
+            }
+
+            Object.entries(interpolated.joints).forEach(([jointId, state]) => {
+              newCharacterStates[track.characterId].joints[jointId] = state;
+            });
+            Object.entries(interpolated.sticks).forEach(([stickId, state]) => {
+              newCharacterStates[track.characterId].sticks[stickId] = state;
+            });
+          }
+        });
+      });
+
+      Object.entries(newCharacterStates).forEach(([characterId, states]) => {
+        applyAnimationToCharacter(characterId, states.joints, states.sticks);
+      });
+
+      setCharacterStates(newCharacterStates);
+      animationFrameRef.current = requestAnimationFrame(animate);
+    };
+    animationFrameRef.current = requestAnimationFrame(animate);
 
     return () => {
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [isPlaying, playbackSpeed, sceneDuration, currentTime, setCurrentTime, setPlaying]);
+  }, [isPlaying, playbackSpeed, sceneDuration, currentTime, currentScene, actions, setCurrentTime, setPlaying, applyAnimationToCharacter]);
+
+  useEffect(() => {
+    if (isPlaying || !currentScene) return;
+
+    const newCharacterStates: TrackCharacterState = {};
+
+    currentScene.tracks.forEach((track) => {
+      if (!track.visible) return;
+
+      track.clips.forEach((clip) => {
+        const clipEndTime = clip.startTime + clip.duration;
+        if (currentTime >= clip.startTime && currentTime <= clipEndTime) {
+          const action = actions.find((a) => a.id === clip.actionId);
+          if (!action) return;
+
+          const relativeTime = (currentTime - clip.startTime) * clip.speed;
+          const clampedTime = Math.max(0, Math.min(action.duration, relativeTime));
+          const interpolated = interpolateKeyframes(action.keyframes, clampedTime);
+
+          if (!newCharacterStates[track.characterId]) {
+            newCharacterStates[track.characterId] = { joints: {}, sticks: {} };
+          }
+
+          Object.entries(interpolated.joints).forEach(([jointId, state]) => {
+            newCharacterStates[track.characterId].joints[jointId] = state;
+          });
+          Object.entries(interpolated.sticks).forEach(([stickId, state]) => {
+            newCharacterStates[track.characterId].sticks[stickId] = state;
+          });
+        }
+      });
+    });
+
+    Object.entries(newCharacterStates).forEach(([characterId, states]) => {
+      applyAnimationToCharacter(characterId, states.joints, states.sticks);
+    });
+
+    setCharacterStates(newCharacterStates);
+  }, [currentTime, isPlaying, currentScene, actions, applyAnimationToCharacter]);
 
   const formatTime = (ms: number): string => {
-    const seconds = Math.floor(ms / 1000);
+    const totalSeconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
     const milliseconds = Math.floor((ms % 1000) / 10);
-    return `${seconds.toString().padStart(2, '0')}:${milliseconds.toString().padStart(2, '0')}`;
+    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${milliseconds.toString().padStart(2, '0')}`;
   };
 
   const handlePlayPause = () => {
@@ -120,55 +293,113 @@ const ActionTimeline: React.FC = () => {
   };
 
   const handleTimelineClick = (e: React.MouseEvent) => {
+    if (draggingPlayhead || dragState) return;
     if (!timelineRef.current) return;
     const rect = timelineRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const time = (x / pixelsPerSecond) * 1000;
+    const x = e.clientX - rect.left + timelineRef.current.scrollLeft;
+    const time = x / pixelsPerMs;
     setCurrentTime(Math.max(0, Math.min(sceneDuration, time)));
   };
 
-  const handleClipMouseDown = (e: React.MouseEvent, clip: Clip, track: Track) => {
+  const handlePlayheadMouseDown = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setDraggingPlayhead(true);
+  };
+
+  const handlePlayheadDrag = useCallback(
+    (e: MouseEvent) => {
+      if (!draggingPlayhead || !timelineRef.current) return;
+      const rect = timelineRef.current.getBoundingClientRect();
+      const x = e.clientX - rect.left + timelineRef.current.scrollLeft;
+      const time = x / pixelsPerMs;
+      setCurrentTime(Math.max(0, Math.min(sceneDuration, time)));
+    },
+    [draggingPlayhead, pixelsPerMs, sceneDuration, setCurrentTime]
+  );
+
+  const handlePlayheadDragEnd = useCallback(() => {
+    setDraggingPlayhead(false);
+  }, []);
+
+  useEffect(() => {
+    if (draggingPlayhead) {
+      window.addEventListener('mousemove', handlePlayheadDrag);
+      window.addEventListener('mouseup', handlePlayheadDragEnd);
+      return () => {
+        window.removeEventListener('mousemove', handlePlayheadDrag);
+        window.removeEventListener('mouseup', handlePlayheadDragEnd);
+      };
+    }
+  }, [draggingPlayhead, handlePlayheadDrag, handlePlayheadDragEnd]);
+
+  const handleClipMouseDown = (e: React.MouseEvent, clip: Clip, track: Track, type: 'move' | 'resize-left' | 'resize-right') => {
     e.stopPropagation();
     if (track.locked) return;
 
-    setDraggingClip({
+    setDragState({
+      type,
       clipId: clip.id,
       trackId: track.id,
       startX: e.clientX,
       startTime: clip.startTime,
+      startDuration: clip.duration,
     });
   };
 
   const handleMouseMove = useCallback(
     (e: MouseEvent) => {
-      if (!draggingClip || !currentDramaId || !currentSceneId || !currentScene) return;
+      if (!dragState || !currentDramaId || !currentSceneId || !currentScene) return;
 
-      const deltaX = e.clientX - draggingClip.startX;
-      const deltaTime = (deltaX / pixelsPerSecond) * 1000;
-      let newStartTime = draggingClip.startTime + deltaTime;
-      newStartTime = Math.max(0, newStartTime);
+      const deltaX = e.clientX - dragState.startX;
+      const deltaTime = deltaX / pixelsPerMs;
+      setDragTimeIndicator(dragState.startTime + deltaTime);
 
       const updatedTracks = currentScene.tracks.map((track) => {
-        if (track.id !== draggingClip.trackId) return track;
+        if (track.id !== dragState.trackId) return track;
+
         return {
           ...track,
-          clips: track.clips.map((clip) =>
-            clip.id === draggingClip.clipId ? { ...clip, startTime: newStartTime } : clip
-          ),
+          clips: track.clips.map((clip) => {
+            if (clip.id !== dragState.clipId) return clip;
+
+            if (dragState.type === 'move') {
+              let newStartTime = dragState.startTime + deltaTime;
+              newStartTime = Math.max(0, Math.min(sceneDuration - clip.duration, newStartTime));
+              return { ...clip, startTime: newStartTime };
+            } else if (dragState.type === 'resize-left') {
+              let newStartTime = dragState.startTime + deltaTime;
+              let newDuration = dragState.startDuration - deltaTime;
+              newStartTime = Math.max(0, newStartTime);
+              newDuration = Math.max(100, newDuration);
+              if (newStartTime + newDuration > sceneDuration) {
+                newDuration = sceneDuration - newStartTime;
+              }
+              return { ...clip, startTime: newStartTime, duration: newDuration };
+            } else if (dragState.type === 'resize-right') {
+              let newDuration = dragState.startDuration + deltaTime;
+              newDuration = Math.max(100, newDuration);
+              if (dragState.startTime + newDuration > sceneDuration) {
+                newDuration = sceneDuration - dragState.startTime;
+              }
+              return { ...clip, duration: newDuration };
+            }
+            return clip;
+          }),
         };
       });
 
       updateScene(currentDramaId, currentSceneId, { tracks: updatedTracks });
     },
-    [draggingClip, currentDramaId, currentSceneId, currentScene, pixelsPerSecond, updateScene]
+    [dragState, currentDramaId, currentSceneId, currentScene, pixelsPerMs, sceneDuration, updateScene]
   );
 
   const handleMouseUp = useCallback(() => {
-    setDraggingClip(null);
+    setDragState(null);
+    setDragTimeIndicator(null);
   }, []);
 
   useEffect(() => {
-    if (draggingClip) {
+    if (dragState) {
       window.addEventListener('mousemove', handleMouseMove);
       window.addEventListener('mouseup', handleMouseUp);
       return () => {
@@ -176,7 +407,88 @@ const ActionTimeline: React.FC = () => {
         window.removeEventListener('mouseup', handleMouseUp);
       };
     }
-  }, [draggingClip, handleMouseMove, handleMouseUp]);
+  }, [dragState, handleMouseMove, handleMouseUp]);
+
+  const handleContextMenu = (e: React.MouseEvent, clip: Clip, track: Track) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (track.locked) return;
+    setContextMenu({
+      show: true,
+      x: e.clientX,
+      y: e.clientY,
+      clip,
+      track,
+    });
+  };
+
+  const handleDeleteClip = () => {
+    if (!contextMenu.clip || !contextMenu.track || !currentDramaId || !currentSceneId || !currentScene) return;
+
+    const updatedTracks = currentScene.tracks.map((track) => {
+      if (track.id !== contextMenu.track!.id) return track;
+      return {
+        ...track,
+        clips: track.clips.filter((clip) => clip.id !== contextMenu.clip!.id),
+      };
+    });
+
+    updateScene(currentDramaId, currentSceneId, { tracks: updatedTracks });
+    setContextMenu({ show: false, x: 0, y: 0, clip: null, track: null });
+  };
+
+  const handleDuplicateClip = () => {
+    if (!contextMenu.clip || !contextMenu.track || !currentDramaId || !currentSceneId || !currentScene) return;
+
+    const newClip: Clip = {
+      ...contextMenu.clip,
+      id: generateId(),
+      startTime: contextMenu.clip.startTime + 500,
+    };
+
+    const updatedTracks = currentScene.tracks.map((track) => {
+      if (track.id !== contextMenu.track!.id) return track;
+      return {
+        ...track,
+        clips: [...track.clips, newClip],
+      };
+    });
+
+    updateScene(currentDramaId, currentSceneId, { tracks: updatedTracks });
+    setContextMenu({ show: false, x: 0, y: 0, clip: null, track: null });
+  };
+
+  const handleAdjustSpeed = (speed: number) => {
+    if (!contextMenu.clip || !contextMenu.track || !currentDramaId || !currentSceneId || !currentScene) return;
+
+    const updatedTracks = currentScene.tracks.map((track) => {
+      if (track.id !== contextMenu.track!.id) return track;
+      return {
+        ...track,
+        clips: track.clips.map((clip) =>
+          clip.id === contextMenu.clip!.id ? { ...clip, speed } : clip
+        ),
+      };
+    });
+
+    updateScene(currentDramaId, currentSceneId, { tracks: updatedTracks });
+    setContextMenu({ show: false, x: 0, y: 0, clip: null, track: null });
+  };
+
+  const handleClipHover = (e: React.MouseEvent, clip: Clip) => {
+    const rect = timelineRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setHoverInfo({
+      show: true,
+      x: e.clientX - rect.left + 10,
+      y: e.clientY - rect.top - 60,
+      clip,
+    });
+  };
+
+  const handleClipLeave = () => {
+    setHoverInfo({ show: false, x: 0, y: 0, clip: null });
+  };
 
   const toggleTrackVisibility = (trackId: string) => {
     if (!currentDramaId || !currentSceneId || !currentScene) return;
@@ -211,63 +523,20 @@ const ActionTimeline: React.FC = () => {
     setTimelineZoom((prev) => Math.max(0.25, prev / 1.2));
   };
 
-  const handleCheckOcclusion = () => {
-    setOcclusionResult({
-      show: true,
-      hasIssue: false,
-      message: '当前帧未检测到签杆遮挡问题',
-    });
-    setTimeout(() => {
-      setOcclusionResult((prev) => ({ ...prev, show: false }));
-    }, 3000);
+  const handleAddActionClick = (action: Action) => {
+    setSelectedActionForAdd(action);
+    setShowActionDropdown(false);
+    setShowTrackDialog(true);
   };
 
-  const getActionById = (actionId: string): Action | undefined => {
-    return actions.find((a) => a.id === actionId);
-  };
-
-  const getClipColor = (actionId: string): string => {
-    const action = getActionById(actionId);
-    const colors = [
-      'bg-crimson-500',
-      'bg-shadow-500',
-      'bg-ink-500',
-      'bg-parchment-500',
-    ];
-    const index = action ? action.name.charCodeAt(0) % colors.length : 0;
-    return colors[index];
-  };
-
-  const renderTimeMarkers = () => {
-    const markers = [];
-    const totalSeconds = Math.ceil(sceneDuration / 1000);
-    const step = timelineZoom < 0.5 ? 2 : timelineZoom > 1.5 ? 0.5 : 1;
-
-    for (let t = 0; t <= totalSeconds; t += step) {
-      const left = (t * 1000 * pixelsPerSecond) / 1000;
-      markers.push(
-        <div
-          key={t}
-          className="absolute top-0 h-full border-l border-ink-600/50"
-          style={{ left: `${left}px` }}
-        >
-          <span className="absolute -top-5 left-1 text-xs text-parchment-400">
-            {t.toFixed(step < 1 ? 1 : 0)}s
-          </span>
-        </div>
-      );
-    }
-    return markers;
-  };
-
-  const handleAddActionToTrack = (trackId: string, action: Action) => {
-    if (!currentDramaId || !currentSceneId || !currentScene) return;
+  const handleSelectTrack = (trackId: string) => {
+    if (!selectedActionForAdd || !currentDramaId || !currentSceneId || !currentScene) return;
 
     const newClip: Clip = {
-      id: Math.random().toString(36).substring(2, 11),
-      actionId: action.id,
+      id: generateId(),
+      actionId: selectedActionForAdd.id,
       startTime: currentTime,
-      duration: action.duration,
+      duration: selectedActionForAdd.duration,
       speed: 1,
       trackId,
     };
@@ -277,18 +546,121 @@ const ActionTimeline: React.FC = () => {
     );
 
     updateScene(currentDramaId, currentSceneId, { tracks: updatedTracks });
-    setShowActionLibrary(false);
+    setShowTrackDialog(false);
+    setSelectedActionForAdd(null);
   };
+
+  const handleSaveScene = () => {
+    if (!currentDramaId || !currentSceneId || !currentScene) return;
+
+    updateScene(currentDramaId, currentSceneId, {
+      tracks: currentScene.tracks,
+    });
+
+    updateDrama(currentDramaId, {
+      updatedAt: Date.now(),
+    });
+
+    setSaveSuccess(true);
+    setTimeout(() => setSaveSuccess(false), 2000);
+  };
+
+  const handleCheckOcclusion = () => {
+    if (!displayCharacter) return;
+
+    const results = checkStickOcclusion(displayCharacter.sticks, displayCharacter);
+    setOcclusionResults(results);
+    setOcclusionChecked(true);
+    setShowOcclusionPanel(true);
+  };
+
+  const handleAutoFixOcclusion = () => {
+    if (!displayCharacter || !currentDramaId) return;
+
+    const fixedSticks = autoFixOcclusion(displayCharacter.sticks, occlusionResults);
+    
+    fixedSticks.forEach(stick => {
+      updateStick(currentDramaId, displayCharacter.id, stick.id, {
+        zIndex: stick.zIndex,
+      });
+    });
+
+    setTimeout(() => {
+      const updatedCharacter = characters.find(c => c.id === displayCharacter.id);
+      if (updatedCharacter) {
+        const newResults = checkStickOcclusion(updatedCharacter.sticks, updatedCharacter);
+        setOcclusionResults(newResults);
+      }
+    }, 100);
+  };
+
+  const getActionById = (actionId: string): Action | undefined => {
+    return actions.find((a) => a.id === actionId);
+  };
+
+  const getCharacterById = (characterId: string): Character | undefined => {
+    return characters.find((c) => c.id === characterId);
+  };
+
+  const getTrackColor = (track: Track): string => {
+    const character = getCharacterById(track.characterId);
+    if (character) {
+      const index = character.name.charCodeAt(0) % TRACK_COLORS.length;
+      return TRACK_COLORS[index];
+    }
+    const index = track.name.charCodeAt(0) % TRACK_COLORS.length;
+    return TRACK_COLORS[index];
+  };
+
+  const getClipColor = (actionId: string): string => {
+    const action = getActionById(actionId);
+    const index = action ? action.name.charCodeAt(0) % TRACK_COLORS.length : 0;
+    return TRACK_COLORS[index];
+  };
+
+  const renderTimeMarkers = () => {
+    const markers = [];
+    const totalMs = sceneDuration;
+    const majorStep = 1000;
+    const minorStep = 100;
+
+    for (let t = 0; t <= totalMs; t += minorStep) {
+      const left = t * pixelsPerMs;
+      const isMajor = t % majorStep === 0;
+
+      markers.push(
+        <div
+          key={t}
+          className={cn(
+            'absolute top-0 border-l',
+            isMajor ? 'h-full border-ink-400/60' : 'h-3 border-ink-600/40'
+          )}
+          style={{ left: `${left}px` }}
+        >
+          {isMajor && (
+            <span className="absolute -top-5 left-1 text-xs text-parchment-400 font-mono">
+              {formatTime(t)}
+            </span>
+          )}
+        </div>
+      );
+    }
+    return markers;
+  };
+
+  const displayCharacter = useMemo(() => {
+    if (currentCharacter) return currentCharacter;
+    if (characters.length > 0) return characters[0];
+    return null;
+  }, [currentCharacter, characters]);
 
   return (
     <div className="flex flex-col h-full bg-parchment-50">
-      {/* 上半部分 - 预览和控制 */}
       <div className="flex-1 min-h-0 flex border-b-2 border-ink-600">
-        {/* 左侧预览画布 */}
         <div className="flex-1 min-w-0 relative bg-parchment-100">
-          {currentCharacter ? (
+          {displayCharacter ? (
             <ShadowPuppetCanvas
-              character={currentCharacter}
+              character={displayCharacter}
               showJoints={false}
               showSticks={true}
               showConstraints={false}
@@ -305,33 +677,20 @@ const ActionTimeline: React.FC = () => {
             </div>
           )}
 
-          {occlusionResult.show && (
-            <div
-              className={cn(
-                'absolute top-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg shadow-lg flex items-center gap-2 transition-all',
-                occlusionResult.hasIssue
-                  ? 'bg-crimson-500 text-white'
-                  : 'bg-green-600 text-white'
-              )}
-            >
-              {occlusionResult.hasIssue ? (
-                <AlertTriangle className="w-4 h-4" />
-              ) : (
-                <CheckCircle className="w-4 h-4" />
-              )}
-              <span className="text-sm font-medium">{occlusionResult.message}</span>
+          {saveSuccess && (
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg shadow-lg bg-green-600 text-white flex items-center gap-2 animate-fade-in">
+              <CheckCircle className="w-4 h-4" />
+              <span className="text-sm font-medium">场次保存成功</span>
             </div>
           )}
         </div>
 
-        {/* 右侧控制面板 */}
         <div className="w-72 flex flex-col bg-gradient-to-b from-ink-700 to-ink-800 border-l border-ink-600">
           <div className="h-14 flex items-center px-4 border-b border-ink-600">
             <h2 className="font-display text-base text-parchment-100 font-semibold">播放控制</h2>
           </div>
 
           <div className="flex-1 overflow-y-auto p-4 space-y-6">
-            {/* 当前时间显示 */}
             <div className="text-center">
               <div className="text-4xl font-mono text-shadow-400 font-bold tracking-wider">
                 {formatTime(currentTime)}
@@ -341,7 +700,6 @@ const ActionTimeline: React.FC = () => {
               </div>
             </div>
 
-            {/* 播放控制按钮 */}
             <div className="flex items-center justify-center gap-2">
               <button
                 onClick={handlePrevFrame}
@@ -373,7 +731,6 @@ const ActionTimeline: React.FC = () => {
               </button>
             </div>
 
-            {/* 播放速度 */}
             <div className="space-y-2">
               <label className="block text-xs text-parchment-400 font-medium">播放速度</label>
               <div className="flex items-center gap-2">
@@ -396,10 +753,8 @@ const ActionTimeline: React.FC = () => {
               </div>
             </div>
 
-            {/* 分隔线 */}
             <div className="border-t border-ink-600" />
 
-            {/* 灯光效果控制 */}
             <div className="space-y-3">
               <div className="flex items-center gap-2">
                 <Sun className="w-4 h-4 text-shadow-400" />
@@ -472,38 +827,110 @@ const ActionTimeline: React.FC = () => {
               </div>
             </div>
 
-            {/* 分隔线 */}
             <div className="border-t border-ink-600" />
 
-            {/* 签杆遮挡校验 */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <Scan className="w-4 h-4 text-shadow-400" />
+                <span className="text-sm font-medium text-parchment-200">签杆遮挡校验</span>
+              </div>
+
+              <button
+                onClick={handleCheckOcclusion}
+                className={cn(
+                  'w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg transition-colors shadow-lg',
+                  occlusionChecked && occlusionResults.length > 0 && occlusionResults.some(o => !o.isCorrect)
+                    ? 'bg-amber-500 hover:bg-amber-400 text-white shadow-amber-500/20'
+                    : 'bg-ink-600 hover:bg-ink-500 text-parchment-200'
+                )}
+              >
+                <Scan className="w-4 h-4" />
+                <span className="text-sm font-medium">
+                  {occlusionChecked
+                    ? occlusionResults.length > 0
+                      ? `检测到 ${occlusionResults.length} 处交叉`
+                      : '未检测到交叉'
+                    : '开始校验'}
+                </span>
+              </button>
+
+              {occlusionChecked && occlusionResults.length > 0 && (
+                <div className="space-y-2">
+                  {occlusionResults.some(o => !o.isCorrect) ? (
+                    <button
+                      onClick={handleAutoFixOcclusion}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-crimson-500 hover:bg-crimson-400 text-white rounded-lg transition-colors shadow-lg shadow-crimson-500/20"
+                    >
+                      <Wrench className="w-4 h-4" />
+                      <span className="text-sm font-medium">自动修复</span>
+                    </button>
+                  ) : (
+                    <div className="flex items-center justify-center gap-2 px-3 py-2 bg-green-600/20 text-green-400 rounded-lg">
+                      <CheckCircle className="w-4 h-4" />
+                      <span className="text-xs font-medium">所有交叉层级正确</span>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="border-t border-ink-600" />
+
             <button
-              onClick={handleCheckOcclusion}
-              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-shadow-600 hover:bg-shadow-500 text-parchment-100 rounded-lg transition-colors"
+              onClick={handleSaveScene}
+              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-crimson-500 hover:bg-crimson-400 text-white rounded-lg transition-colors shadow-lg shadow-crimson-500/20"
             >
-              <CheckCircle className="w-4 h-4" />
-              <span className="text-sm font-medium">签杆遮挡校验</span>
+              <Save className="w-4 h-4" />
+              <span className="text-sm font-medium">保存场次</span>
             </button>
           </div>
         </div>
       </div>
 
-      {/* 下半部分 - 时间轴 */}
-      <div className="h-80 flex flex-col bg-gradient-to-b from-ink-800 to-ink-900">
-        {/* 时间轴工具栏 */}
-        <div className="h-10 flex items-center justify-between px-4 border-b border-ink-600 bg-ink-700/50">
+      <div className="h-96 flex flex-col bg-gradient-to-b from-ink-800 to-ink-900 relative">
+        <div className="h-12 flex items-center justify-between px-4 border-b border-ink-600 bg-ink-700/50">
           <div className="flex items-center gap-2">
-            <button
-              onClick={() => setShowActionLibrary(!showActionLibrary)}
-              className={cn(
-                'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm transition-colors',
-                showActionLibrary
-                  ? 'bg-crimson-500 text-white'
-                  : 'bg-ink-600 text-parchment-300 hover:bg-ink-500 hover:text-parchment-100'
+            <div className="relative" ref={dropdownRef}>
+              <button
+                onClick={() => setShowActionDropdown(!showActionDropdown)}
+                className={cn(
+                  'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm transition-colors',
+                  showActionDropdown
+                    ? 'bg-crimson-500 text-white'
+                    : 'bg-ink-600 text-parchment-300 hover:bg-ink-500 hover:text-parchment-100'
+                )}
+              >
+                <Plus className="w-4 h-4" />
+                <span>添加动作</span>
+                <ChevronDown className="w-3 h-3" />
+              </button>
+
+              {showActionDropdown && (
+                <div className="absolute top-full left-0 mt-1 w-64 bg-ink-700 border border-ink-600 rounded-lg shadow-xl z-50 max-h-80 overflow-y-auto">
+                  {actions.length > 0 ? (
+                    actions.map((action) => (
+                      <button
+                        key={action.id}
+                        onClick={() => handleAddActionClick(action)}
+                        className="w-full flex items-center gap-2 px-3 py-2 hover:bg-ink-600 transition-colors text-left"
+                      >
+                        <div className={cn('w-3 h-3 rounded-sm', getClipColor(action.id))} />
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm text-parchment-200 truncate">{action.name}</div>
+                          <div className="text-xs text-parchment-500">
+                            {action.category} · {(action.duration / 1000).toFixed(1)}s
+                          </div>
+                        </div>
+                      </button>
+                    ))
+                  ) : (
+                    <div className="px-3 py-4 text-center text-parchment-500 text-sm">
+                      暂无动作，请先创建动作
+                    </div>
+                  )}
+                </div>
               )}
-            >
-              <Plus className="w-4 h-4" />
-              <span>添加动作</span>
-            </button>
+            </div>
           </div>
 
           <div className="flex items-center gap-2">
@@ -514,7 +941,7 @@ const ActionTimeline: React.FC = () => {
             >
               <ZoomOut className="w-4 h-4" />
             </button>
-            <span className="text-xs text-parchment-400 w-12 text-center">
+            <span className="text-xs text-parchment-400 w-12 text-center font-mono">
               {Math.round(timelineZoom * 100)}%
             </span>
             <button
@@ -527,21 +954,17 @@ const ActionTimeline: React.FC = () => {
           </div>
         </div>
 
-        {/* 时间轴主体 */}
         <div className="flex-1 min-h-0 flex overflow-hidden">
-          {/* 左侧轨道列表 */}
-          <div className="w-48 flex-shrink-0 border-r border-ink-600 bg-ink-800/50">
-            <div className="h-8 flex items-center px-3 border-b border-ink-600 bg-ink-700/30">
+          <div className="w-52 flex-shrink-0 border-r border-ink-600 bg-ink-800/50">
+            <div className="h-10 flex items-center px-3 border-b border-ink-600 bg-ink-700/30">
               <span className="text-xs font-medium text-parchment-400">轨道</span>
             </div>
             <div className="overflow-y-auto">
               {currentScene?.tracks.map((track) => {
                 const isExpanded = expandedTracks[track.id] ?? true;
+                const character = getCharacterById(track.characterId);
                 return (
-                  <div
-                    key={track.id}
-                    className="border-b border-ink-700/50"
-                  >
+                  <div key={track.id} className="border-b border-ink-700/50">
                     <div
                       className={cn(
                         'h-12 flex items-center gap-2 px-3 transition-colors',
@@ -559,11 +982,18 @@ const ActionTimeline: React.FC = () => {
                         )}
                       </button>
 
-                      <div className="w-2 h-2 rounded-full bg-crimson-500" />
+                      <div className={cn('w-2 h-2 rounded-full', getTrackColor(track))} />
 
-                      <span className="flex-1 text-sm text-parchment-200 truncate">
-                        {track.name}
-                      </span>
+                      <div className="flex-1 min-w-0">
+                        <span className="text-sm text-parchment-200 truncate block">
+                          {track.name}
+                        </span>
+                        {character && (
+                          <span className="text-xs text-parchment-500 truncate block">
+                            {character.name}
+                          </span>
+                        )}
+                      </div>
 
                       <button
                         onClick={() => toggleTrackVisibility(track.id)}
@@ -593,25 +1023,7 @@ const ActionTimeline: React.FC = () => {
                     </div>
 
                     {isExpanded && (
-                      <div className="h-14 border-t border-ink-700/30 bg-ink-900/30">
-                        {showActionLibrary && (
-                          <div className="h-full flex items-center justify-center">
-                            <button
-                              onClick={() => {
-                                const firstAction = actions[0];
-                                if (firstAction) {
-                                  handleAddActionToTrack(track.id, firstAction);
-                                }
-                              }}
-                              disabled={track.locked || actions.length === 0}
-                              className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-ink-600/50 text-parchment-400 hover:bg-ink-600 hover:text-parchment-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                            >
-                              <Plus className="w-3 h-3" />
-                              添加片段
-                            </button>
-                          </div>
-                        )}
-                      </div>
+                      <div className="h-16 border-t border-ink-700/30 bg-ink-900/30" />
                     )}
                   </div>
                 );
@@ -619,19 +1031,16 @@ const ActionTimeline: React.FC = () => {
             </div>
           </div>
 
-          {/* 右侧时间轴区域 */}
           <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
-            {/* 时间刻度 */}
-            <div className="h-8 flex-shrink-0 relative border-b border-ink-600 bg-ink-700/30 overflow-hidden">
+            <div className="h-10 flex-shrink-0 relative border-b border-ink-600 bg-ink-700/30 overflow-hidden">
               <div
                 className="absolute inset-0"
-                style={{ width: `${(sceneDuration / 1000) * pixelsPerSecond}px` }}
+                style={{ width: `${sceneDuration * pixelsPerMs}px` }}
               >
                 {renderTimeMarkers()}
               </div>
             </div>
 
-            {/* 轨道内容 */}
             <div
               ref={timelineRef}
               className="flex-1 relative overflow-x-auto overflow-y-auto cursor-pointer"
@@ -639,121 +1048,348 @@ const ActionTimeline: React.FC = () => {
             >
               <div
                 className="relative"
-                style={{ width: `${(sceneDuration / 1000) * pixelsPerSecond}px`, minWidth: '100%' }}
+                style={{ width: `${sceneDuration * pixelsPerMs}px`, minWidth: '100%' }}
               >
                 {currentScene?.tracks.map((track) => {
                   const isExpanded = expandedTracks[track.id] ?? true;
                   return (
                     <div key={track.id} className="border-b border-ink-700/50">
-                      <div className="h-12 border-b border-ink-700/30">
-                        <div className="h-full flex items-center px-2">
-                          <div className="flex gap-2">
-                            {track.clips
-                              .sort((a, b) => a.startTime - b.startTime)
-                              .map((clip) => {
-                                const action = getActionById(clip.actionId);
-                                const left = (clip.startTime / 1000) * pixelsPerSecond;
-                                const width = (clip.duration / 1000) * pixelsPerSecond;
+                      <div className="h-12 border-b border-ink-700/30 relative">
+                        {track.clips
+                          .sort((a, b) => a.startTime - b.startTime)
+                          .map((clip) => {
+                            const action = getActionById(clip.actionId);
+                            const left = clip.startTime * pixelsPerMs;
+                            const width = clip.duration * pixelsPerMs;
+                            const isDragging = dragState?.clipId === clip.id;
 
-                                return (
-                                  <div
-                                    key={clip.id}
-                                    className={cn(
-                                      'absolute top-2 h-8 rounded-md flex items-center px-2 overflow-hidden cursor-grab active:cursor-grabbing transition-shadow',
-                                      getClipColor(clip.actionId),
-                                      track.locked && 'opacity-60 cursor-not-allowed',
-                                      !track.visible && 'opacity-40',
-                                      draggingClip?.clipId === clip.id && 'ring-2 ring-white shadow-lg'
-                                    )}
-                                    style={{
-                                      left: `${left}px`,
-                                      width: `${Math.max(40, width)}px`,
-                                    }}
-                                    onMouseDown={(e) => handleClipMouseDown(e, clip, track)}
-                                  >
-                                    <GripHorizontal className="w-3 h-3 text-white/60 mr-1 flex-shrink-0" />
-                                    <span className="text-xs text-white font-medium truncate">
-                                      {action?.name || '未知动作'}
-                                    </span>
-                                  </div>
-                                );
-                              })}
-                          </div>
-                        </div>
+                            return (
+                              <div
+                                key={clip.id}
+                                className={cn(
+                                  'absolute top-2 h-8 rounded-md flex items-center px-2 overflow-hidden cursor-grab active:cursor-grabbing transition-shadow group',
+                                  getClipColor(clip.actionId),
+                                  track.locked && 'opacity-60 cursor-not-allowed',
+                                  !track.visible && 'opacity-40',
+                                  isDragging && 'ring-2 ring-white shadow-lg z-10'
+                                )}
+                                style={{
+                                  left: `${left}px`,
+                                  width: `${Math.max(40, width)}px`,
+                                }}
+                                onMouseDown={(e) => handleClipMouseDown(e, clip, track, 'move')}
+                                onContextMenu={(e) => handleContextMenu(e, clip, track)}
+                                onMouseEnter={(e) => handleClipHover(e, clip)}
+                                onMouseMove={(e) => handleClipHover(e, clip)}
+                                onMouseLeave={handleClipLeave}
+                              >
+                                <div
+                                  className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-white/30 rounded-l-md transition-colors"
+                                  onMouseDown={(e) => handleClipMouseDown(e, clip, track, 'resize-left')}
+                                />
+                                <div
+                                  className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-white/30 rounded-r-md transition-colors"
+                                  onMouseDown={(e) => handleClipMouseDown(e, clip, track, 'resize-right')}
+                                />
+
+                                <GripHorizontal className="w-3 h-3 text-white/60 mr-1 flex-shrink-0" />
+                                <span className="text-xs text-white font-medium truncate flex-1">
+                                  {action?.name || '未知动作'}
+                                </span>
+                                <span className="text-xs text-white/70 font-mono ml-1 flex-shrink-0">
+                                  {(clip.duration / 1000).toFixed(1)}s
+                                </span>
+                                {clip.speed !== 1 && (
+                                  <span className="text-xs text-white/70 font-mono ml-1 flex-shrink-0">
+                                    {clip.speed}x
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })}
                       </div>
 
                       {isExpanded && (
-                        <div className="h-14 bg-ink-900/20 border-t border-ink-700/30">
-                          {track.clips.length === 0 && showActionLibrary && (
-                            <div className="h-full flex items-center justify-center">
-                              <span className="text-xs text-parchment-500">拖入动作片段</span>
-                            </div>
-                          )}
-                        </div>
+                        <div className="h-16 bg-ink-900/20 border-t border-ink-700/30" />
                       )}
                     </div>
                   );
                 })}
 
-                {/* 播放头 */}
                 <div
-                  className="absolute top-0 bottom-0 w-0.5 bg-crimson-500 pointer-events-none z-10"
-                  style={{ left: `${(currentTime / 1000) * pixelsPerSecond}px` }}
+                  className="absolute top-0 bottom-0 w-0.5 bg-crimson-500 pointer-events-none z-20"
+                  style={{ left: `${currentTime * pixelsPerMs}px` }}
                 >
-                  <div className="absolute -top-0 -left-1.5 w-3 h-3 bg-crimson-500 rotate-45" />
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* 动作库面板 */}
-        {showActionLibrary && (
-          <div className="absolute bottom-80 left-0 right-0 h-40 bg-ink-800 border-t-2 border-crimson-500 shadow-2xl z-20">
-            <div className="h-10 flex items-center justify-between px-4 border-b border-ink-600 bg-ink-700">
-              <h3 className="text-sm font-medium text-parchment-200">动作库</h3>
-              <button
-                onClick={() => setShowActionLibrary(false)}
-                className="text-parchment-400 hover:text-parchment-200 transition-colors"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            <div className="p-3 overflow-y-auto h-[calc(100%-2.5rem)]">
-              <div className="grid grid-cols-4 gap-2">
-                {actions.map((action) => (
                   <div
-                    key={action.id}
-                    className="p-3 bg-ink-700 rounded-lg border border-ink-600 hover:border-crimson-500/50 hover:bg-ink-600 cursor-pointer transition-all group"
-                    draggable
-                    onDragStart={(e) => {
-                      e.dataTransfer.setData('actionId', action.id);
-                    }}
+                    className="absolute -top-0 -left-1.5 w-3 h-3 bg-crimson-500 rotate-45 cursor-ew-resize pointer-events-auto hover:scale-110 transition-transform"
+                    onMouseDown={handlePlayheadMouseDown}
+                  />
+                </div>
+
+                {dragTimeIndicator !== null && (
+                  <div
+                    className="absolute top-0 bottom-0 w-px bg-yellow-400 pointer-events-none z-30"
+                    style={{ left: `${dragTimeIndicator * pixelsPerMs}px` }}
                   >
-                    <div className="flex items-center gap-2 mb-1">
-                      <div className={cn('w-3 h-3 rounded-sm', getClipColor(action.id))} />
-                      <span className="text-sm font-medium text-parchment-200 truncate">
-                        {action.name}
-                      </span>
-                    </div>
-                    <div className="text-xs text-parchment-500">{action.category}</div>
-                    <div className="text-xs text-parchment-400 mt-1 font-mono">
-                      {(action.duration / 1000).toFixed(1)}s
+                    <div className="absolute -top-6 left-1/2 -translate-x-1/2 px-2 py-0.5 bg-yellow-400 text-ink-900 text-xs font-mono rounded whitespace-nowrap">
+                      {formatTime(dragTimeIndicator)}
                     </div>
                   </div>
-                ))}
-                {actions.length === 0 && (
-                  <div className="col-span-4 text-center py-8 text-parchment-500">
-                    暂无动作，请先创建动作
+                )}
+
+                {hoverInfo.show && hoverInfo.clip && (
+                  <div
+                    className="absolute z-40 px-3 py-2 bg-ink-700 border border-ink-600 rounded-lg shadow-xl pointer-events-none"
+                    style={{ left: `${hoverInfo.x}px`, top: `${hoverInfo.y}px` }}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <Info className="w-3 h-3 text-shadow-400" />
+                      <span className="text-sm font-medium text-parchment-200">
+                        {getActionById(hoverInfo.clip.actionId)?.name || '未知动作'}
+                      </span>
+                    </div>
+                    <div className="text-xs text-parchment-400 space-y-0.5 font-mono">
+                      <div>开始: {formatTime(hoverInfo.clip.startTime)}</div>
+                      <div>结束: {formatTime(hoverInfo.clip.startTime + hoverInfo.clip.duration)}</div>
+                      <div>时长: {(hoverInfo.clip.duration / 1000).toFixed(2)}s</div>
+                      <div>速度: {hoverInfo.clip.speed}x</div>
+                    </div>
                   </div>
                 )}
               </div>
             </div>
           </div>
-        )}
+        </div>
       </div>
+
+      {showTrackDialog && selectedActionForAdd && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-ink-800 border border-ink-600 rounded-xl shadow-2xl w-96 max-h-[80vh] overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-ink-600 bg-ink-700">
+              <h3 className="text-sm font-medium text-parchment-200">选择轨道</h3>
+              <button
+                onClick={() => {
+                  setShowTrackDialog(false);
+                  setSelectedActionForAdd(null);
+                }}
+                className="text-parchment-400 hover:text-parchment-200 transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4">
+              <div className="mb-3 p-3 bg-ink-700/50 rounded-lg">
+                <div className="flex items-center gap-2 mb-1">
+                  <div className={cn('w-3 h-3 rounded-sm', getClipColor(selectedActionForAdd.id))} />
+                  <span className="text-sm font-medium text-parchment-200">{selectedActionForAdd.name}</span>
+                </div>
+                <div className="text-xs text-parchment-400">
+                  时长: {(selectedActionForAdd.duration / 1000).toFixed(1)}s · 将添加到 {formatTime(currentTime)}
+                </div>
+              </div>
+              <div className="space-y-1 max-h-60 overflow-y-auto">
+                {currentScene?.tracks.map((track) => {
+                  const character = getCharacterById(track.characterId);
+                  return (
+                    <button
+                      key={track.id}
+                      onClick={() => handleSelectTrack(track.id)}
+                      disabled={track.locked}
+                      className={cn(
+                        'w-full flex items-center gap-2 px-3 py-2 rounded-lg transition-colors text-left',
+                        track.locked
+                          ? 'bg-ink-700/30 opacity-50 cursor-not-allowed'
+                          : 'bg-ink-700 hover:bg-ink-600 cursor-pointer'
+                      )}
+                    >
+                      <div className={cn('w-2 h-2 rounded-full', getTrackColor(track))} />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm text-parchment-200 truncate">{track.name}</div>
+                        {character && (
+                          <div className="text-xs text-parchment-500 truncate">{character.name}</div>
+                        )}
+                      </div>
+                      {track.locked && <Lock className="w-3 h-3 text-crimson-400" />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {contextMenu.show && contextMenu.clip && (
+        <div
+          className="fixed z-50 bg-ink-700 border border-ink-600 rounded-lg shadow-xl py-1 min-w-40"
+          style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
+        >
+          <button
+            onClick={handleDeleteClip}
+            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-parchment-200 hover:bg-ink-600 transition-colors"
+          >
+            <Trash2 className="w-4 h-4 text-crimson-400" />
+            <span>删除</span>
+          </button>
+          <button
+            onClick={handleDuplicateClip}
+            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-parchment-200 hover:bg-ink-600 transition-colors"
+          >
+            <Copy className="w-4 h-4 text-shadow-400" />
+            <span>复制</span>
+          </button>
+          <div className="border-t border-ink-600 my-1" />
+          <div className="px-3 py-1">
+            <div className="flex items-center gap-2 mb-1">
+              <Gauge className="w-3 h-3 text-parchment-400" />
+              <span className="text-xs text-parchment-400">调整速度</span>
+            </div>
+            <div className="grid grid-cols-4 gap-1">
+              {[0.5, 0.75, 1, 1.25, 1.5, 2].map((speed) => (
+                <button
+                  key={speed}
+                  onClick={() => handleAdjustSpeed(speed)}
+                  className={cn(
+                    'px-2 py-1 text-xs rounded transition-colors',
+                    contextMenu.clip!.speed === speed
+                      ? 'bg-crimson-500 text-white'
+                      : 'bg-ink-600 text-parchment-300 hover:bg-ink-500'
+                  )}
+                >
+                  {speed}x
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showOcclusionPanel && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-ink-800 border border-ink-600 rounded-xl shadow-2xl w-[500px] max-h-[80vh] overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-ink-600 bg-ink-700">
+              <div className="flex items-center gap-2">
+                <Scan className="w-5 h-5 text-shadow-400" />
+                <h3 className="text-sm font-medium text-parchment-200">签杆遮挡校验结果</h3>
+              </div>
+              <button
+                onClick={() => setShowOcclusionPanel(false)}
+                className="text-parchment-400 hover:text-parchment-200 transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 overflow-y-auto max-h-[60vh]">
+              {occlusionResults.length === 0 ? (
+                <div className="text-center py-8">
+                  <CheckCircle className="w-12 h-12 text-green-500 mx-auto mb-3" />
+                  <p className="text-parchment-300 text-sm">未检测到签杆交叉</p>
+                  <p className="text-parchment-500 text-xs mt-1">所有签杆布局正常</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between px-3 py-2 bg-ink-700/50 rounded-lg">
+                    <span className="text-xs text-parchment-400">
+                      共检测到 {occlusionResults.length} 处交叉
+                    </span>
+                    <span className="text-xs text-parchment-400">
+                      {occlusionResults.filter(o => !o.isCorrect).length} 处需要修复
+                    </span>
+                  </div>
+
+                  {occlusionResults.map((occlusion, index) => (
+                    <div
+                      key={index}
+                      className={cn(
+                        'p-4 rounded-lg border transition-colors',
+                        occlusion.isCorrect
+                          ? 'bg-green-900/20 border-green-800/50'
+                          : 'bg-amber-900/20 border-amber-800/50'
+                      )}
+                    >
+                      <div className="flex items-start justify-between mb-3">
+                        <div className="flex items-center gap-2">
+                          {occlusion.isCorrect ? (
+                            <CheckCircle className="w-4 h-4 text-green-500 flex-shrink-0 mt-0.5" />
+                          ) : (
+                            <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                          )}
+                          <span className="text-sm font-medium text-parchment-200">
+                            {occlusion.stickName1} <span className="text-parchment-500">vs</span> {occlusion.stickName2}
+                          </span>
+                        </div>
+                        <span className={cn(
+                          'text-xs px-2 py-0.5 rounded-full font-medium',
+                          occlusion.isCorrect
+                            ? 'bg-green-600/30 text-green-400'
+                            : 'bg-amber-600/30 text-amber-400'
+                        )}>
+                          {occlusion.isCorrect ? '层级正确' : '层级错误'}
+                        </span>
+                      </div>
+
+                      <div className="space-y-2 text-xs">
+                        <div className="flex items-center gap-2 text-parchment-400">
+                          <Info className="w-3 h-3" />
+                          <span>
+                            交点坐标: ({occlusion.intersectionPoint.x.toFixed(1)}, {occlusion.intersectionPoint.y.toFixed(1)})
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-2 text-parchment-400">
+                          <ArrowUpDown className="w-3 h-3" />
+                          <span>
+                            应在前面: <span className="text-parchment-200 font-medium">
+                              {occlusion.frontStickId === occlusion.stickId1 ? occlusion.stickName1 : occlusion.stickName2}
+                            </span>
+                          </span>
+                        </div>
+
+                        <div className="mt-2 p-2 bg-ink-900/50 rounded text-parchment-300">
+                          <span className="text-parchment-500">建议: </span>
+                          {occlusion.suggestion}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="px-4 py-3 border-t border-ink-600 bg-ink-700/50 flex items-center justify-between">
+              <button
+                onClick={handleCheckOcclusion}
+                className="flex items-center gap-2 px-4 py-2 bg-ink-600 hover:bg-ink-500 text-parchment-200 rounded-lg transition-colors text-sm"
+              >
+                <Scan className="w-4 h-4" />
+                <span>重新校验</span>
+              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowOcclusionPanel(false)}
+                  className="px-4 py-2 bg-ink-600 hover:bg-ink-500 text-parchment-200 rounded-lg transition-colors text-sm"
+                >
+                  关闭
+                </button>
+
+                {occlusionResults.length > 0 && occlusionResults.some(o => !o.isCorrect) && (
+                  <button
+                    onClick={() => {
+                      handleAutoFixOcclusion();
+                    }}
+                    className="flex items-center gap-2 px-4 py-2 bg-crimson-500 hover:bg-crimson-400 text-white rounded-lg transition-colors text-sm shadow-lg shadow-crimson-500/20"
+                  >
+                    <Wrench className="w-4 h-4" />
+                    <span>自动修复</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

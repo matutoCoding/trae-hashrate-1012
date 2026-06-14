@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   AlertTriangle,
   AlertCircle,
@@ -18,33 +18,128 @@ import { checkAngleViolation } from '@/utils/kinematics';
 import type { Joint, ConstraintWarning } from '@/types';
 
 type JointStatus = 'normal' | 'warning' | 'error';
+type GroupKey = 'headNeck' | 'leftArm' | 'rightArm' | 'leftLeg' | 'rightLeg';
+
+interface JointGroup {
+  key: GroupKey;
+  name: string;
+  jointNames: string[];
+}
+
+const JOINT_GROUPS: JointGroup[] = [
+  {
+    key: 'headNeck',
+    name: '头部颈部',
+    jointNames: ['颈部', '躯干顶'],
+  },
+  {
+    key: 'leftArm',
+    name: '左臂',
+    jointNames: ['左肩', '左肘', '左腕'],
+  },
+  {
+    key: 'rightArm',
+    name: '右臂',
+    jointNames: ['右肩', '右肘', '右腕'],
+  },
+  {
+    key: 'leftLeg',
+    name: '左腿',
+    jointNames: ['左胯', '左膝', '左踝'],
+  },
+  {
+    key: 'rightLeg',
+    name: '右腿',
+    jointNames: ['右胯', '右膝', '右踝'],
+  },
+];
+
+function getJointGroupKey(jointName: string): GroupKey | null {
+  if (jointName.startsWith('左') && /[肩肘腕]/.test(jointName)) {
+    return 'leftArm';
+  }
+  if (jointName.startsWith('右') && /[肩肘腕]/.test(jointName)) {
+    return 'rightArm';
+  }
+  if (jointName.startsWith('左') && /[胯膝踝]/.test(jointName)) {
+    return 'leftLeg';
+  }
+  if (jointName.startsWith('右') && /[胯膝踝]/.test(jointName)) {
+    return 'rightLeg';
+  }
+  if (jointName.includes('颈') || jointName.includes('躯干')) {
+    return 'headNeck';
+  }
+  return null;
+}
 
 interface JointNodeProps {
   joint: Joint;
-  joints: Joint[];
   status: JointStatus;
   isSelected: boolean;
-  isExpanded: boolean;
   onSelect: (id: string) => void;
-  onToggle: (id: string) => void;
   level: number;
 }
 
 const JointNode: React.FC<JointNodeProps> = ({
   joint,
-  joints,
   status,
   isSelected,
-  isExpanded,
   onSelect,
-  onToggle,
   level,
 }) => {
-  const childJoint = joints.find(j => j.id === joint.childId);
-  const hasChildren = !!childJoint;
-
   const StatusIcon = status === 'error' ? AlertCircle : status === 'warning' ? AlertTriangle : CheckCircle;
   const statusColor = status === 'error' ? 'text-crimson-500' : status === 'warning' ? 'text-shadow-500' : 'text-emerald-500';
+
+  return (
+    <div
+      className={cn(
+        'flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer transition-all duration-150',
+        isSelected
+          ? 'bg-crimson-500/20 text-crimson-300'
+          : 'hover:bg-ink-600/50 text-parchment-200 hover:text-parchment-100'
+      )}
+      style={{ paddingLeft: `${level * 16 + 8}px` }}
+      onClick={() => onSelect(joint.id)}
+    >
+      <div className="w-5" />
+      <StatusIcon className={cn('w-4 h-4 flex-shrink-0', statusColor)} />
+      <span className="text-sm font-medium truncate">{joint.name}</span>
+    </div>
+  );
+};
+
+interface GroupNodeProps {
+  group: JointGroup;
+  joints: Joint[];
+  isExpanded: boolean;
+  isSelected: boolean;
+  groupStatus: JointStatus;
+  selectedJointId: string | null;
+  onToggle: (key: GroupKey) => void;
+  onSelectJoint: (id: string) => void;
+  level: number;
+}
+
+const GroupNode: React.FC<GroupNodeProps> = ({
+  group,
+  joints,
+  isExpanded,
+  isSelected,
+  groupStatus,
+  selectedJointId,
+  onToggle,
+  onSelectJoint,
+  level,
+}) => {
+  const StatusIcon = groupStatus === 'error' ? AlertCircle : groupStatus === 'warning' ? AlertTriangle : CheckCircle;
+  const statusColor = groupStatus === 'error' ? 'text-crimson-500' : groupStatus === 'warning' ? 'text-shadow-500' : 'text-emerald-500';
+
+  const groupJoints = useMemo(() => {
+    return group.jointNames
+      .map(name => joints.find(j => j.name === name))
+      .filter((j): j is Joint => j !== undefined);
+  }, [group.jointNames, joints]);
 
   return (
     <div>
@@ -56,39 +151,40 @@ const JointNode: React.FC<JointNodeProps> = ({
             : 'hover:bg-ink-600/50 text-parchment-200 hover:text-parchment-100'
         )}
         style={{ paddingLeft: `${level * 16 + 8}px` }}
-        onClick={() => onSelect(joint.id)}
+        onClick={() => onToggle(group.key)}
       >
-        {hasChildren ? (
-          <button
-            className="p-0.5 rounded hover:bg-ink-500/50 text-parchment-400"
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggle(joint.id);
-            }}
-          >
-            {isExpanded ? (
-              <ChevronDown className="w-4 h-4" />
-            ) : (
-              <ChevronRight className="w-4 h-4" />
-            )}
-          </button>
-        ) : (
-          <div className="w-5" />
-        )}
+        <button
+          className="p-0.5 rounded hover:bg-ink-500/50 text-parchment-400"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggle(group.key);
+          }}
+        >
+          {isExpanded ? (
+            <ChevronDown className="w-4 h-4" />
+          ) : (
+            <ChevronRight className="w-4 h-4" />
+          )}
+        </button>
         <StatusIcon className={cn('w-4 h-4 flex-shrink-0', statusColor)} />
-        <span className="text-sm font-medium truncate">{joint.name}</span>
+        <span className="text-sm font-medium flex-1">{group.name}</span>
+        <span className="text-xs text-parchment-400 font-mono">
+          {groupJoints.length}
+        </span>
       </div>
-      {hasChildren && isExpanded && childJoint && (
-        <JointNode
-          joint={childJoint}
-          joints={joints}
-          status={getJointStatus(childJoint)}
-          isSelected={isSelected}
-          isExpanded={isExpanded}
-          onSelect={onSelect}
-          onToggle={onToggle}
-          level={level + 1}
-        />
+      {isExpanded && (
+        <div className="mt-0.5">
+          {groupJoints.map(joint => (
+            <JointNode
+              key={joint.id}
+              joint={joint}
+              status={getJointStatus(joint)}
+              isSelected={selectedJointId === joint.id}
+              onSelect={onSelectJoint}
+              level={level + 1}
+            />
+          ))}
+        </div>
       )}
     </div>
   );
@@ -129,6 +225,24 @@ const ergonomicPresets: Record<string, { minAngle: number; maxAngle: number; loc
   '右踝': { minAngle: -30, maxAngle: 30, locked: false, reverseAllowed: false },
 };
 
+function getGroupStatus(group: JointGroup, joints: Joint[]): JointStatus {
+  const groupJoints = group.jointNames
+    .map(name => joints.find(j => j.name === name))
+    .filter((j): j is Joint => j !== undefined);
+  
+  let status: JointStatus = 'normal';
+  for (const joint of groupJoints) {
+    const jointStatus = getJointStatus(joint);
+    if (jointStatus === 'error') {
+      return 'error';
+    }
+    if (jointStatus === 'warning') {
+      status = 'warning';
+    }
+  }
+  return status;
+}
+
 export default function JointConstraints() {
   const currentDrama = useAppStore(state => state.getCurrentDrama());
   const currentCharacter = useAppStore(state => state.getCurrentCharacter());
@@ -141,25 +255,10 @@ export default function JointConstraints() {
   const setConstraintWarnings = useAppStore(state => state.setConstraintWarnings);
   const setJointAngle = useAppStore(state => state.setJointAngle);
 
-  const [expandedJoints, setExpandedJoints] = useState<Set<string>>(new Set());
+  const [expandedGroups, setExpandedGroups] = useState<Set<GroupKey>>(new Set(['headNeck', 'leftArm', 'rightArm', 'leftLeg', 'rightLeg']));
   const [testMode, setTestMode] = useState(false);
 
   const selectedJoint = currentCharacter?.joints.find(j => j.id === selectedJointId);
-
-  const rootJoints = currentCharacter?.joints.filter(j => !j.parentId) || [];
-
-  useEffect(() => {
-    if (currentCharacter) {
-      const rootId = currentCharacter.joints.find(j => !j.parentId)?.id;
-      if (rootId) {
-        setExpandedJoints(prev => {
-          const next = new Set(prev);
-          next.add(rootId);
-          return next;
-        });
-      }
-    }
-  }, [currentCharacter]);
 
   useEffect(() => {
     if (!currentCharacter) return;
@@ -184,17 +283,37 @@ export default function JointConstraints() {
     setConstraintWarnings(warnings);
   }, [currentCharacter, setConstraintWarnings]);
 
-  const toggleJoint = useCallback((id: string) => {
-    setExpandedJoints(prev => {
+  useEffect(() => {
+    if (!selectedJointId || !currentCharacter) return;
+    
+    const joint = currentCharacter.joints.find(j => j.id === selectedJointId);
+    if (joint) {
+      const groupKey = getJointGroupKey(joint.name);
+      if (groupKey && !expandedGroups.has(groupKey)) {
+        setExpandedGroups(prev => {
+          const next = new Set(prev);
+          next.add(groupKey);
+          return next;
+        });
+      }
+    }
+  }, [selectedJointId, currentCharacter, expandedGroups]);
+
+  const toggleGroup = useCallback((key: GroupKey) => {
+    setExpandedGroups(prev => {
       const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
+      if (next.has(key)) {
+        next.delete(key);
       } else {
-        next.add(id);
+        next.add(key);
       }
       return next;
     });
   }, []);
+
+  const handleSelectJoint = useCallback((jointId: string) => {
+    setSelectedJoint(jointId);
+  }, [setSelectedJoint]);
 
   const handleMinAngleChange = (value: number) => {
     if (!selectedJointId || !currentDramaId || !currentCharacterId) return;
@@ -297,17 +416,18 @@ export default function JointConstraints() {
           </p>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-2">
-          {rootJoints.map(joint => (
-            <JointNode
-              key={joint.id}
-              joint={joint}
+        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+          {JOINT_GROUPS.map(group => (
+            <GroupNode
+              key={group.key}
+              group={group}
               joints={currentCharacter.joints}
-              status={getJointStatus(joint)}
-              isSelected={selectedJointId === joint.id}
-              isExpanded={expandedJoints.has(joint.id)}
-              onSelect={setSelectedJoint}
-              onToggle={toggleJoint}
+              isExpanded={expandedGroups.has(group.key)}
+              isSelected={false}
+              groupStatus={getGroupStatus(group, currentCharacter.joints)}
+              selectedJointId={selectedJointId}
+              onToggle={toggleGroup}
+              onSelectJoint={handleSelectJoint}
               level={0}
             />
           ))}

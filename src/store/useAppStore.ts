@@ -39,11 +39,14 @@ interface AppState {
   addNewCharacter: (dramaId: string, name: string, role: string) => void;
   
   updatePart: (dramaId: string, characterId: string, partId: string, updates: Partial<Part>) => void;
+  addPart: (dramaId: string, characterId: string, part: Part) => void;
   
   updateJoint: (dramaId: string, characterId: string, jointId: string, updates: Partial<Joint>) => void;
   setJointAngle: (dramaId: string, characterId: string, jointId: string, angle: number) => void;
+  setCharacterJointAngle: (characterId: string, jointId: string, angle: number) => void;
   
   updateStick: (dramaId: string, characterId: string, stickId: string, updates: Partial<Stick>) => void;
+  setStickState: (characterId: string, stickId: string, state: Partial<Stick>) => void;
   
   addAction: (dramaId: string, action: Action) => void;
   updateAction: (dramaId: string, actionId: string, updates: Partial<Action>) => void;
@@ -185,7 +188,7 @@ export const useAppStore = create<AppState>()(
       })),
       
       addNewCharacter: (dramaId, name, role) => {
-        const character = createDefaultCharacter();
+        const { character } = createDefaultCharacter();
         character.name = name;
         character.role = role;
         get().addCharacter(dramaId, character);
@@ -203,6 +206,25 @@ export const useAppStore = create<AppState>()(
                         parts: c.parts.map(p =>
                           p.id === partId ? { ...p, ...updates } : p
                         ),
+                      }
+                    : c
+                ),
+                updatedAt: Date.now(),
+              }
+            : d
+        ),
+      })),
+      
+      addPart: (dramaId, characterId, part) => set(state => ({
+        dramas: state.dramas.map(d =>
+          d.id === dramaId
+            ? {
+                ...d,
+                characters: d.characters.map(c =>
+                  c.id === characterId
+                    ? {
+                        ...c,
+                        parts: [...c.parts, part],
                       }
                     : c
                 ),
@@ -237,6 +259,13 @@ export const useAppStore = create<AppState>()(
         get().updateJoint(dramaId, characterId, jointId, { currentAngle: angle });
       },
       
+      setCharacterJointAngle: (characterId, jointId, angle) => {
+        const { currentDramaId } = get();
+        if (currentDramaId) {
+          get().updateJoint(currentDramaId, characterId, jointId, { currentAngle: angle });
+        }
+      },
+      
       updateStick: (dramaId, characterId, stickId, updates) => set(state => ({
         dramas: state.dramas.map(d =>
           d.id === dramaId
@@ -257,6 +286,13 @@ export const useAppStore = create<AppState>()(
             : d
         ),
       })),
+      
+      setStickState: (characterId, stickId, state) => {
+        const { currentDramaId } = get();
+        if (currentDramaId) {
+          get().updateStick(currentDramaId, characterId, stickId, state);
+        }
+      },
       
       addAction: (dramaId, action) => set(state => ({
         dramas: state.dramas.map(d =>
